@@ -52,19 +52,12 @@ typedef struct {
 } button_t;
 
 static xcb_window_t top_win;
-static xcb_pixmap_t top_pixmap;
-static xcb_gcontext_t top_pixmap_gc;
 static xcb_rectangle_t top_rect = {0, 0, 600, 20};
 static xcb_window_t bottom_win;
-static xcb_pixmap_t bottom_pixmap;
-static xcb_gcontext_t bottom_pixmap_gc;
 static xcb_rectangle_t bottom_rect = {0, 0, 600, 20};
-static i3Font font;
-static i3String *prompt;
 
 /* Result of get_colorpixel() for the various colors. */
 static color_t color_background;        /* background of the bar */
-static color_t color_text;              /* color of the text */
 
 xcb_window_t root;
 xcb_connection_t *conn;
@@ -100,39 +93,12 @@ void debuglog(char *fmt, ...) {
  */
 static int handle_expose_top(xcb_connection_t *conn, xcb_expose_event_t *event) {
     /* re-draw the background */
-    xcb_change_gc(conn, top_pixmap_gc, XCB_GC_FOREGROUND, (uint32_t[]){color_background.colorpixel});
-    xcb_poly_fill_rectangle(conn, top_pixmap, top_pixmap_gc, 1, &top_rect);
-
-    /* restore font color */
-    set_font_colors(top_pixmap_gc, color_text, color_background);
-    draw_text(prompt, top_pixmap, top_pixmap_gc, NULL,
-              logical_px(4) + logical_px(4),
-              logical_px(4) + logical_px(4),
-              top_rect.width - logical_px(4) - logical_px(4));
-
-    /* Copy the contents of the pixmap to the real window */
-    xcb_copy_area(conn, top_pixmap, top_win, top_pixmap_gc, 0, 0, 0, 0, top_rect.width, top_rect.height);
     xcb_flush(conn);
-
     return 1;
 }
 
 static int handle_expose_bottom(xcb_connection_t *conn, xcb_expose_event_t *event) {
-    /* re-draw the background */
-    xcb_change_gc(conn, bottom_pixmap_gc, XCB_GC_FOREGROUND, (uint32_t[]){color_background.colorpixel});
-    xcb_poly_fill_rectangle(conn, bottom_pixmap, bottom_pixmap_gc, 1, &bottom_rect);
-
-    /* restore font color */
-    set_font_colors(bottom_pixmap_gc, color_text, color_background);
-    draw_text(prompt, bottom_pixmap, bottom_pixmap_gc, NULL,
-              logical_px(4) + logical_px(4),
-              logical_px(4) + logical_px(4),
-              bottom_rect.width - logical_px(4) - logical_px(4));
-
-    /* Copy the contents of the pixmap to the real window */
-    xcb_copy_area(conn, bottom_pixmap, top_win, bottom_pixmap_gc, 0, 0, 0, 0, bottom_rect.width, bottom_rect.height);
     xcb_flush(conn);
-
     return 1;
 }
 
@@ -224,23 +190,17 @@ int main(int argc, char *argv[]) {
         err(EXIT_FAILURE, "execv(/bin/sh, /bin/sh, %s)", cmd);
     }
 
-
     argv0 = argv[0];
 
-    char *pattern = sstrdup("pango:monospace 8");
     int o, option_index = 0;
 
     static struct option long_options[] = {
         {"version", no_argument, 0, 'v'},
         {"tallness", required_argument, 0, 't'},
-        {"font", required_argument, 0, 'f'},
         {"help", no_argument, 0, 'h'},
-        {"message", required_argument, 0, 'm'},
         {0, 0, 0, 0}};
 
-    char *options_string = "b:f:m:vh";
-
-    prompt = i3string_from_utf8("");
+    char *options_string = "b:t:vh";
 
     srand(time(NULL));
     max_offset = DEFAULT_MAX_OFFSET;
@@ -249,19 +209,19 @@ int main(int argc, char *argv[]) {
             case 'v':
                 printf("i3-oled-bar" I3_VERSION "\n");
                 return 0;
-            case 't': // Tallness
-                max_offset = (int) atoi(optarg);
-            case 'f':
-                FREE(pattern);
-                pattern = sstrdup(optarg);
-                break;
-            case 'm':
-                i3string_free(prompt);
-                prompt = i3string_from_utf8(optarg);
+            case 't': {// Tallness
+                    char* endp = NULL;
+                    if (!optarg)
+                    {
+                        fprintf(stderr, "invalid m option %s - expecting a number\n", optarg?optarg:"");
+                        return 0;
+                    }
+                    max_offset = (int) strtoul(optarg, &endp, 10);
+                }
                 break;
             case 'h':
                 printf("i3-oled-bar " I3_VERSION "\n");
-                printf("i3-oled-bar [-m <message>] [-b <button> <action>] [-t warning|error] [-f <font>] [-v]\n");
+                printf("i3-oled-bar  [-t tallness] [-v]\n");
                 return 0;
         }
     }
@@ -282,11 +242,8 @@ int main(int argc, char *argv[]) {
     root_screen = xcb_aux_get_screen(conn, screens);
     root = root_screen->root;
 
+    // Set the colors
     color_background = draw_util_hex_to_color("#000000");
-    color_text = draw_util_hex_to_color("#dddddd");
-
-    font = load_font(pattern, true);
-    set_font(&font);
 
 #if defined(__OpenBSD__)
     if (pledge("stdio rpath wpath cpath getpw proc exec", NULL) == -1)
@@ -412,10 +369,10 @@ int main(int argc, char *argv[]) {
     memset(&top_strut_partial, 0, sizeof(top_strut_partial));
     memset(&bottom_strut_partial, 0, sizeof(bottom_strut_partial));
 
-    top_strut_partial.top = font.height + logical_px(6);
+    top_strut_partial.top = 1;
     top_strut_partial.top_start_x = 0;
     top_strut_partial.top_end_x = 800;
-    bottom_strut_partial.bottom = font.height + logical_px(6);
+    bottom_strut_partial.bottom = 1;
     bottom_strut_partial.bottom_start_x = 0;
     bottom_strut_partial.bottom_end_x = 800;
 
@@ -435,16 +392,7 @@ int main(int argc, char *argv[]) {
                         32,
                         12,
                         &bottom_strut_partial);
-    /* Create pixmap */
-    top_pixmap = xcb_generate_id(conn);
-    top_pixmap_gc = xcb_generate_id(conn);
-    xcb_create_pixmap(conn, root_screen->root_depth, top_pixmap, top_win, 500, font.height + logical_px(8));
-    xcb_create_gc(conn, top_pixmap_gc, top_pixmap, 0, 0);
 
-    bottom_pixmap = xcb_generate_id(conn);
-    bottom_pixmap_gc = xcb_generate_id(conn);
-    xcb_create_pixmap(conn, root_screen->root_depth, bottom_pixmap, bottom_win, 500, font.height + logical_px(8));
-    xcb_create_gc(conn, bottom_pixmap_gc, bottom_pixmap, 0, 0);
     /* Grab the keyboard to get all input */
     xcb_flush(conn);
 
@@ -477,24 +425,12 @@ int main(int argc, char *argv[]) {
                         configure_notify->y,
                         configure_notify->width,
                         configure_notify->height};
-                    /* Recreate the pixmap / gc */
-                    xcb_free_pixmap(conn, top_pixmap);
-                    xcb_free_gc(conn, top_pixmap_gc);
-
-                    xcb_create_pixmap(conn, root_screen->root_depth, top_pixmap, top_win, top_rect.width, top_rect.height);
-                    xcb_create_gc(conn, top_pixmap_gc, top_pixmap, 0, 0);
                 } else { //if (configure_notify->window == bottom_win) {
                     bottom_rect = (xcb_rectangle_t){
                         configure_notify->x,
                         configure_notify->y,
                         configure_notify->width,
                         configure_notify->height};
-                    /* Recreate the pixmap / gc */
-                    xcb_free_pixmap(conn, bottom_pixmap);
-                    xcb_free_gc(conn, bottom_pixmap_gc);
-
-                    xcb_create_pixmap(conn, root_screen->root_depth, bottom_pixmap, bottom_win, bottom_rect.width, bottom_rect.height);
-                    xcb_create_gc(conn, bottom_pixmap_gc, bottom_pixmap, 0, 0);
                 }
                 break;
             }
@@ -502,8 +438,6 @@ int main(int argc, char *argv[]) {
 
         free(event);
     }
-
-    FREE(pattern);
 
     return 0;
 }
