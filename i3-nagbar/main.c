@@ -3,14 +3,12 @@
  *
  * i3 - an improved dynamic tiling window manager
  * © 2009 Michael Stapelberg and contributors (see also: LICENSE)
- * Converted from nagbar to oled-bar by Andrew Barrett-Sprot
  *
- * i3-oled-bar is a utility which slightly offsets the screen to reduce burn-in
+ * i3-nagbar is a utility which displays a nag message, for example in the case
+ * when the user has an error in their configuration file.
  *
  */
 #include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -38,11 +36,8 @@
 /** This is the equivalent of XC_left_ptr. I’m not sure why xcb doesn’t have a
  * constant for that. */
 #define XCB_CURSOR_LEFT_PTR 68
-static char *argv0 = NULL;
-#define DEFAULT_MAX_OFFSET 200 // testing purposes
 
-static int random_height;
-static int max_offset;
+static char *argv0 = NULL;
 
 typedef struct {
     i3String *label;
@@ -51,13 +46,21 @@ typedef struct {
     uint16_t width;
 } button_t;
 
-static xcb_window_t top_win;
-static xcb_rectangle_t top_rect = {0, 0, 600, 20};
-static xcb_window_t bottom_win;
-static xcb_rectangle_t bottom_rect = {0, 0, 600, 20};
+static xcb_window_t win;
+static xcb_pixmap_t pixmap;
+static xcb_gcontext_t pixmap_gc;
+static xcb_rectangle_t rect = {0, 0, 600, 20};
+static i3Font font;
+static i3String *prompt;
+static button_t *buttons;
+static int buttoncnt;
 
 /* Result of get_colorpixel() for the various colors. */
 static color_t color_background;        /* background of the bar */
+static color_t color_button_background; /* background for buttons */
+static color_t color_border;            /* color of the button border */
+static color_t color_border_bottom;     /* color of the bottom border */
+static color_t color_text;              /* color of the text */
 
 xcb_window_t root;
 xcb_connection_t *conn;
@@ -87,18 +90,207 @@ void debuglog(char *fmt, ...) {
 }
 
 /*
+ * Starts the given application by passing it through a shell. We use double fork
+ * to avoid zombie processes. As the started application’s parent exits (immediately),
+ * the application is reparented to init (process-id 1), which correctly handles
+ * childs, so we don’t have to do it :-).
+ *
+ * The shell is determined by looking for the SHELL environment variable. If it
+ * does not exist, /bin/sh is used.
+ *
+ */
+static void start_application(const char *command) {
+    printf("executing: %s\n", command);
+    if (fork() == 0) {
+        /* Child process */
+        setsid();
+        if (fork() == 0) {
+            /* This is the child */
+            execl(_PATH_BSHELL, _PATH_BSHELL, "-c", command, (void *)NULL);
+            /* not reached */
+        }
+        exit(0);
+    }
+    wait(0);
+}
+
+static button_t *get_button_at(int16_t x, int16_t y) {
+    for (int c = 0; c < buttoncnt; c++)
+        if (x >= (buttons[c].x) && x <= (buttons[c].x + buttons[c].width))
+            return &buttons[c];
+
+    return NULL;
+}
+
+static void handle_button_press(xcb_connection_t *conn, xcb_button_press_event_t *event) {
+    printf("button pressed on x = %d, y = %d\n",
+           event->event_x, event->event_y);
+    /* TODO: set a flag for the button, re-render */
+}
+
+/*
+ * Called when the user releases the mouse button. Checks whether the
+ * coordinates are over a button and executes the appropriate action.
+ *
+ */
+static void handle_button_release(xcb_connection_t *conn, xcb_button_release_event_t *event) {
+    printf("button released on x = %d, y = %d\n",
+           event->event_x, event->event_y);
+    /* If the user hits the close button, we exit(0) */
+    if (event->event_x >= (rect.width - logical_px(32)))
+        exit(0);
+    button_t *button = get_button_at(event->event_x, event->event_y);
+    if (!button)
+        return;
+
+    /* We need to create a custom script containing our actual command
+     * since not every terminal emulator which is contained in
+     * i3-sensible-terminal supports -e with multiple arguments (and not
+     * all of them support -e with one quoted argument either).
+     *
+     * NB: The paths need to be unique, that is, don’t assume users close
+     * their nagbars at any point in time (and they still need to work).
+     * */
+    char *script_path = get_process_filename("nagbar-cmd");
+
+    int fd = open(script_path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd == -1) {
+        warn("Could not create temporary script to store the nagbar command");
+        return;
+    }
+    FILE *script = fdopen(fd, "w");
+    if (script == NULL) {
+        warn("Could not fdopen() temporary script to store the nagbar command");
+        return;
+    }
+    fprintf(script, "#!/bin/sh\nrm %s\n%s", script_path, button->action);
+    /* Also closes fd */
+    fclose(script);
+
+    char *link_path;
+    char *exe_path = get_exe_path(argv0);
+    sasprintf(&link_path, "%s.nagbar_cmd", script_path);
+    if (symlink(exe_path, link_path) == -1) {
+        err(EXIT_FAILURE, "Failed to symlink %s to %s", link_path, exe_path);
+    }
+
+    char *terminal_cmd;
+    sasprintf(&terminal_cmd, "i3-sensible-terminal -e %s", link_path);
+    printf("argv0 = %s\n", argv0);
+    printf("terminal_cmd = %s\n", terminal_cmd);
+
+    start_application(terminal_cmd);
+
+    free(link_path);
+    free(terminal_cmd);
+    free(script_path);
+    free(exe_path);
+
+    /* TODO: unset flag, re-render */
+}
+
+/*
  * Handles expose events (redraws of the window) and rendering in general. Will
  * be called from the code with event == NULL or from X with event != NULL.
  *
  */
-static int handle_expose_top(xcb_connection_t *conn, xcb_expose_event_t *event) {
+static int handle_expose(xcb_connection_t *conn, xcb_expose_event_t *event) {
     /* re-draw the background */
-    xcb_flush(conn);
-    return 1;
-}
+    xcb_change_gc(conn, pixmap_gc, XCB_GC_FOREGROUND, (uint32_t[]){color_background.colorpixel});
+    xcb_poly_fill_rectangle(conn, pixmap, pixmap_gc, 1, &rect);
 
-static int handle_expose_bottom(xcb_connection_t *conn, xcb_expose_event_t *event) {
+    /* restore font color */
+    set_font_colors(pixmap_gc, color_text, color_background);
+    draw_text(prompt, pixmap, pixmap_gc, NULL,
+              logical_px(4) + logical_px(4),
+              logical_px(4) + logical_px(4),
+              rect.width - logical_px(4) - logical_px(4));
+
+    /* render close button */
+    const char *close_button_label = "X";
+    int line_width = logical_px(4);
+    /* set width to the width of the label */
+    int w = predict_text_width(i3string_from_utf8(close_button_label));
+    /* account for left/right padding, which seems to be set to 8px (total) below */
+    w += logical_px(8);
+    int y = rect.width;
+    uint32_t values[3];
+    values[0] = color_button_background.colorpixel;
+    values[1] = line_width;
+    xcb_change_gc(conn, pixmap_gc, XCB_GC_FOREGROUND | XCB_GC_LINE_WIDTH, values);
+
+    xcb_rectangle_t close = {y - w - (2 * line_width), 0, w + (2 * line_width), rect.height};
+    xcb_poly_fill_rectangle(conn, pixmap, pixmap_gc, 1, &close);
+
+    xcb_change_gc(conn, pixmap_gc, XCB_GC_FOREGROUND, (uint32_t[]){color_border.colorpixel});
+    xcb_point_t points[] = {
+        {y - w - (2 * line_width), line_width / 2},
+        {y - (line_width / 2), line_width / 2},
+        {y - (line_width / 2), (rect.height - (line_width / 2)) - logical_px(2)},
+        {y - w - (2 * line_width), (rect.height - (line_width / 2)) - logical_px(2)},
+        {y - w - (2 * line_width), line_width / 2}};
+    xcb_poly_line(conn, XCB_COORD_MODE_ORIGIN, pixmap, pixmap_gc, 5, points);
+
+    values[0] = 1;
+    set_font_colors(pixmap_gc, color_text, color_button_background);
+    /* the x term here seems to set left/right padding */
+    draw_text_ascii(close_button_label, pixmap, pixmap_gc,
+                    y - w - line_width + w / 2 - logical_px(4),
+                    logical_px(4) + logical_px(3),
+                    rect.width - y + w + line_width - w / 2 + logical_px(4));
+    y -= w;
+
+    y -= logical_px(20);
+
+    /* render custom buttons */
+    line_width = 1;
+    for (int c = 0; c < buttoncnt; c++) {
+        /* set w to the width of the label */
+        w = predict_text_width(buttons[c].label);
+        /* account for left/right padding, which seems to be set to 12px (total) below */
+        w += logical_px(12);
+        y -= logical_px(30);
+        xcb_change_gc(conn, pixmap_gc, XCB_GC_FOREGROUND, (uint32_t[]){color_button_background.colorpixel});
+        close = (xcb_rectangle_t){y - w - (2 * line_width), logical_px(2), w + (2 * line_width), rect.height - logical_px(6)};
+        xcb_poly_fill_rectangle(conn, pixmap, pixmap_gc, 1, &close);
+
+        xcb_change_gc(conn, pixmap_gc, XCB_GC_FOREGROUND, (uint32_t[]){color_border.colorpixel});
+        buttons[c].x = y - w - (2 * line_width);
+        buttons[c].width = w;
+        xcb_point_t points2[] = {
+            {y - w - (2 * line_width), (line_width / 2) + logical_px(2)},
+            {y - (line_width / 2), (line_width / 2) + logical_px(2)},
+            {y - (line_width / 2), (rect.height - logical_px(4) - (line_width / 2))},
+            {y - w - (2 * line_width), (rect.height - logical_px(4) - (line_width / 2))},
+            {y - w - (2 * line_width), (line_width / 2) + logical_px(2)}};
+        xcb_poly_line(conn, XCB_COORD_MODE_ORIGIN, pixmap, pixmap_gc, 5, points2);
+
+        values[0] = color_text.colorpixel;
+        values[1] = color_button_background.colorpixel;
+        set_font_colors(pixmap_gc, color_text, color_button_background);
+        /* the x term seems to set left/right padding */
+        draw_text(buttons[c].label, pixmap, pixmap_gc, NULL,
+                  y - w - line_width + logical_px(6),
+                  logical_px(4) + logical_px(3),
+                  rect.width - y + w + line_width - logical_px(6));
+
+        y -= w;
+    }
+
+    /* border line at the bottom */
+    line_width = logical_px(2);
+    values[0] = color_border_bottom.colorpixel;
+    values[1] = line_width;
+    xcb_change_gc(conn, pixmap_gc, XCB_GC_FOREGROUND | XCB_GC_LINE_WIDTH, values);
+    xcb_point_t bottom[] = {
+        {0, rect.height - 0},
+        {rect.width, rect.height - 0}};
+    xcb_poly_line(conn, XCB_COORD_MODE_ORIGIN, pixmap, pixmap_gc, 2, bottom);
+
+    /* Copy the contents of the pixmap to the real window */
+    xcb_copy_area(conn, pixmap, win, pixmap_gc, 0, 0, 0, 0, rect.width, rect.height);
     xcb_flush(conn);
+
     return 1;
 }
 
@@ -106,9 +298,9 @@ static int handle_expose_bottom(xcb_connection_t *conn, xcb_expose_event_t *even
  * Return the position and size the i3-nagbar window should use.
  * This will be the primary output or a fallback if it cannot be determined.
  */
-static xcb_rectangle_t get_window_position(int height) {
+static xcb_rectangle_t get_window_position(void) {
     /* Default values if we cannot determine the primary output or its CRTC info. */
-    xcb_rectangle_t result = (xcb_rectangle_t){50, 50, 500, height};
+    xcb_rectangle_t result = (xcb_rectangle_t){50, 50, 500, font.height + logical_px(8) + logical_px(8)};
 
     xcb_randr_get_screen_resources_current_cookie_t rcookie = xcb_randr_get_screen_resources_current(conn, root);
     xcb_randr_get_output_primary_cookie_t pcookie = xcb_randr_get_output_primary(conn, root);
@@ -192,41 +384,58 @@ int main(int argc, char *argv[]) {
 
     argv0 = argv[0];
 
+    char *pattern = sstrdup("pango:monospace 8");
     int o, option_index = 0;
+    enum { TYPE_ERROR = 0,
+           TYPE_WARNING = 1 } bar_type = TYPE_ERROR;
 
     static struct option long_options[] = {
         {"version", no_argument, 0, 'v'},
-        {"tallness", required_argument, 0, 't'},
+        {"font", required_argument, 0, 'f'},
+        {"button", required_argument, 0, 'b'},
         {"help", no_argument, 0, 'h'},
+        {"message", required_argument, 0, 'm'},
+        {"type", required_argument, 0, 't'},
         {0, 0, 0, 0}};
 
-    char *options_string = "b:t:vh";
+    char *options_string = "b:f:m:t:vh";
 
-    srand(time(NULL));
-    max_offset = DEFAULT_MAX_OFFSET;
+    prompt = i3string_from_utf8("Please do not run this program.");
+
     while ((o = getopt_long(argc, argv, options_string, long_options, &option_index)) != -1) {
         switch (o) {
             case 'v':
-                printf("i3-oled-bar" I3_VERSION "\n");
+                printf("i3-nagbar " I3_VERSION "\n");
                 return 0;
-            case 't': {// Tallness
-                    char* endp = NULL;
-                    if (!optarg)
-                    {
-                        fprintf(stderr, "invalid m option %s - expecting a number\n", optarg?optarg:"");
-                        return 0;
-                    }
-                    max_offset = (int) strtoul(optarg, &endp, 10);
-                }
+            case 'f':
+                FREE(pattern);
+                pattern = sstrdup(optarg);
+                break;
+            case 'm':
+                i3string_free(prompt);
+                prompt = i3string_from_utf8(optarg);
+                break;
+            case 't':
+                bar_type = (strcasecmp(optarg, "warning") == 0 ? TYPE_WARNING : TYPE_ERROR);
                 break;
             case 'h':
-                printf("i3-oled-bar " I3_VERSION "\n");
-                printf("i3-oled-bar  [-t tallness] [-v]\n");
+                printf("i3-nagbar " I3_VERSION "\n");
+                printf("i3-nagbar [-m <message>] [-b <button> <action>] [-t warning|error] [-f <font>] [-v]\n");
                 return 0;
+            case 'b':
+                buttons = srealloc(buttons, sizeof(button_t) * (buttoncnt + 1));
+                buttons[buttoncnt].label = i3string_from_utf8(optarg);
+                buttons[buttoncnt].action = argv[optind];
+                printf("button with label *%s* and action *%s*\n",
+                       i3string_as_utf8(buttons[buttoncnt].label),
+                       buttons[buttoncnt].action);
+                buttoncnt++;
+                printf("now %d buttons\n", buttoncnt);
+                if (optind < argc)
+                    optind++;
+                break;
         }
     }
-
-    random_height = rand() % max_offset;
 
     int screens;
     if ((conn = xcb_connect(NULL, &screens)) == NULL ||
@@ -242,16 +451,31 @@ int main(int argc, char *argv[]) {
     root_screen = xcb_aux_get_screen(conn, screens);
     root = root_screen->root;
 
-    // Set the colors
-    color_background = draw_util_hex_to_color("#000000");
+    if (bar_type == TYPE_ERROR) {
+        /* Red theme for error messages */
+        color_button_background = draw_util_hex_to_color("#680a0a");
+        color_background = draw_util_hex_to_color("#900000");
+        color_text = draw_util_hex_to_color("#ffffff");
+        color_border = draw_util_hex_to_color("#d92424");
+        color_border_bottom = draw_util_hex_to_color("#470909");
+    } else {
+        /* Yellowish theme for warnings */
+        color_button_background = draw_util_hex_to_color("#ffc100");
+        color_background = draw_util_hex_to_color("#ffa8000");
+        color_text = draw_util_hex_to_color("#000000");
+        color_border = draw_util_hex_to_color("#ab7100");
+        color_border_bottom = draw_util_hex_to_color("#ab7100");
+    }
+
+    font = load_font(pattern, true);
+    set_font(&font);
 
 #if defined(__OpenBSD__)
     if (pledge("stdio rpath wpath cpath getpw proc exec", NULL) == -1)
         err(EXIT_FAILURE, "pledge");
 #endif
 
-    xcb_rectangle_t top_win_pos = get_window_position(random_height);
-    xcb_rectangle_t bottom_win_pos = get_window_position(max_offset-random_height);
+    xcb_rectangle_t win_pos = get_window_position();
 
     xcb_cursor_t cursor;
     xcb_cursor_context_t *cursor_ctx;
@@ -273,33 +497,14 @@ int main(int argc, char *argv[]) {
     }
 
     /* Open an input window */
-    top_win = xcb_generate_id(conn);
-    bottom_win = xcb_generate_id(conn);
+    win = xcb_generate_id(conn);
 
     xcb_create_window(
         conn,
         XCB_COPY_FROM_PARENT,
-        top_win,                                                 /* the window id */
+        win,                                                 /* the window id */
         root,                                                /* parent == root */
-        top_win_pos.x, top_win_pos.y, top_win_pos.width, top_win_pos.height, /* dimensions */
-        0,                                                   /* x11 border = 0, we draw our own */
-        XCB_WINDOW_CLASS_INPUT_OUTPUT,
-        XCB_WINDOW_CLASS_COPY_FROM_PARENT, /* copy visual from parent */
-        XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_CURSOR,
-        (uint32_t[]){
-            0, /* back pixel: black */
-            XCB_EVENT_MASK_EXPOSURE |
-                XCB_EVENT_MASK_STRUCTURE_NOTIFY |
-                XCB_EVENT_MASK_BUTTON_PRESS |
-                XCB_EVENT_MASK_BUTTON_RELEASE,
-            cursor});
-
-    xcb_create_window(
-        conn,
-        XCB_COPY_FROM_PARENT,
-        bottom_win,                                                 /* the window id */
-        root,                                                /* parent == root */
-        bottom_win_pos.x, bottom_win_pos.y, bottom_win_pos.width, bottom_win_pos.height, /* dimensions */
+        win_pos.x, win_pos.y, win_pos.width, win_pos.height, /* dimensions */
         0,                                                   /* x11 border = 0, we draw our own */
         XCB_WINDOW_CLASS_INPUT_OUTPUT,
         XCB_WINDOW_CLASS_COPY_FROM_PARENT, /* copy visual from parent */
@@ -313,8 +518,7 @@ int main(int argc, char *argv[]) {
             cursor});
 
     /* Map the window (make it visible) */
-    xcb_map_window(conn, top_win);
-    xcb_map_window(conn, bottom_win);
+    xcb_map_window(conn, win);
 
 /* Setup NetWM atoms */
 #define xmacro(name)                                                                       \
@@ -332,17 +536,7 @@ int main(int argc, char *argv[]) {
     /* Set dock mode */
     xcb_change_property(conn,
                         XCB_PROP_MODE_REPLACE,
-                        top_win,
-                        A__NET_WM_WINDOW_TYPE,
-                        A_ATOM,
-                        32,
-                        1,
-                        (unsigned char *)&A__NET_WM_WINDOW_TYPE_DOCK);
-
-    /* Set dock mode */
-    xcb_change_property(conn,
-                        XCB_PROP_MODE_REPLACE,
-                        bottom_win,
+                        win,
                         A__NET_WM_WINDOW_TYPE,
                         A_ATOM,
                         32,
@@ -350,7 +544,7 @@ int main(int argc, char *argv[]) {
                         (unsigned char *)&A__NET_WM_WINDOW_TYPE_DOCK);
 
     /* Reserve some space at the top of the screen */
-    struct __attribute__((__packed__)) partial{
+    struct {
         uint32_t left;
         uint32_t right;
         uint32_t top;
@@ -363,35 +557,27 @@ int main(int argc, char *argv[]) {
         uint32_t top_end_x;
         uint32_t bottom_start_x;
         uint32_t bottom_end_x;
-    };
-    struct partial top_strut_partial;
-    struct partial bottom_strut_partial;
-    memset(&top_strut_partial, 0, sizeof(top_strut_partial));
-    memset(&bottom_strut_partial, 0, sizeof(bottom_strut_partial));
+    } __attribute__((__packed__)) strut_partial;
+    memset(&strut_partial, 0, sizeof(strut_partial));
 
-    top_strut_partial.top = 1;
-    top_strut_partial.top_start_x = 0;
-    top_strut_partial.top_end_x = 800;
-    bottom_strut_partial.bottom = 1;
-    bottom_strut_partial.bottom_start_x = 0;
-    bottom_strut_partial.bottom_end_x = 800;
+    strut_partial.top = font.height + logical_px(6);
+    strut_partial.top_start_x = 0;
+    strut_partial.top_end_x = 800;
 
     xcb_change_property(conn,
                         XCB_PROP_MODE_REPLACE,
-                        top_win,
+                        win,
                         A__NET_WM_STRUT_PARTIAL,
                         A_CARDINAL,
                         32,
                         12,
-                        &top_strut_partial);
-    xcb_change_property(conn,
-                        XCB_PROP_MODE_REPLACE,
-                        bottom_win,
-                        A__NET_WM_STRUT_PARTIAL,
-                        A_CARDINAL,
-                        32,
-                        12,
-                        &bottom_strut_partial);
+                        &strut_partial);
+
+    /* Create pixmap */
+    pixmap = xcb_generate_id(conn);
+    pixmap_gc = xcb_generate_id(conn);
+    xcb_create_pixmap(conn, root_screen->root_depth, pixmap, win, 500, font.height + logical_px(8));
+    xcb_create_gc(conn, pixmap_gc, pixmap, 0, 0);
 
     /* Grab the keyboard to get all input */
     xcb_flush(conn);
@@ -407,37 +593,40 @@ int main(int argc, char *argv[]) {
         int type = (event->response_type & 0x7F);
 
         switch (type) {
-            case XCB_EXPOSE: {
-                xcb_expose_event_t *expose = (xcb_expose_event_t *)event;
-                if (expose->window == top_win) {
-                    handle_expose_top(conn,expose);
-                } else { // if (expose->window == bottom_win)
-                    handle_expose_bottom(conn,expose);
-                }
+            case XCB_EXPOSE:
+                handle_expose(conn, (xcb_expose_event_t *)event);
                 break;
-            }
+
+            case XCB_BUTTON_PRESS:
+                handle_button_press(conn, (xcb_button_press_event_t *)event);
+                break;
+
+            case XCB_BUTTON_RELEASE:
+                handle_button_release(conn, (xcb_button_release_event_t *)event);
+                break;
 
             case XCB_CONFIGURE_NOTIFY: {
                 xcb_configure_notify_event_t *configure_notify = (xcb_configure_notify_event_t *)event;
-                if (configure_notify->window == top_win) {
-                    top_rect = (xcb_rectangle_t){
-                        configure_notify->x,
-                        configure_notify->y,
-                        configure_notify->width,
-                        configure_notify->height};
-                } else { //if (configure_notify->window == bottom_win) {
-                    bottom_rect = (xcb_rectangle_t){
-                        configure_notify->x,
-                        configure_notify->y,
-                        configure_notify->width,
-                        configure_notify->height};
-                }
+                rect = (xcb_rectangle_t){
+                    configure_notify->x,
+                    configure_notify->y,
+                    configure_notify->width,
+                    configure_notify->height};
+
+                /* Recreate the pixmap / gc */
+                xcb_free_pixmap(conn, pixmap);
+                xcb_free_gc(conn, pixmap_gc);
+
+                xcb_create_pixmap(conn, root_screen->root_depth, pixmap, win, rect.width, rect.height);
+                xcb_create_gc(conn, pixmap_gc, pixmap, 0, 0);
                 break;
             }
         }
 
         free(event);
     }
+
+    FREE(pattern);
 
     return 0;
 }
